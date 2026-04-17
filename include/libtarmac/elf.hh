@@ -19,6 +19,7 @@
 #ifndef LIBTARMAC_ELF_HH
 #define LIBTARMAC_ELF_HH
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>

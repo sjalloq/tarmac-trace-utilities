@@ -19,6 +19,7 @@
 #ifndef LIBTARMAC_EXPR_HH
 #define LIBTARMAC_EXPR_HH
 
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <ostream>

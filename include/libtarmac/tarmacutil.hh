@@ -23,6 +23,7 @@
 #include "libtarmac/index.hh"
 #include "libtarmac/misc.hh"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 

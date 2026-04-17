@@ -32,6 +32,7 @@
 #include "libtarmac/registers.hh"
 
 #include <assert.h>
+#include <cstdint>
 #include <fstream>
 #include <memory>
 #include <ostream>

@@ -22,6 +22,7 @@
 #include "libtarmac/elf.hh"
 #include "libtarmac/misc.hh"
 
+#include <cstdint>
 #include <forward_list>
 #include <map>
 #include <string>
