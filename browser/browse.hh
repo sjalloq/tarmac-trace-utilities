@@ -274,6 +274,9 @@ class HighlightedLine : public ParseReceiver {
     virtual void got_event(InstructionEvent &ev) override;
 };
 
-void run_browser(Browser &br);
+class DisassemblyFile;
+
+void run_browser(Browser &br, bool use_terminal_colours,
+                 DisassemblyFile *disasm = nullptr);
 
 #endif // TARMAC_BROWSER_BROWSE_HH

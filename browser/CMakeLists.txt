@@ -21,7 +21,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 if(CURSES_FOUND)
   link_directories(${CURSES_LIBRARY_DIRS})
-  add_executable(tarmac-browser browse.cpp curses.cpp ${EXTRA_FILES})
+  add_executable(tarmac-browser browse.cpp curses.cpp disassembly.cpp ${EXTRA_FILES})
   standard_target_configuration(tarmac-browser)
   target_include_directories(tarmac-browser PRIVATE ${CURSES_INCLUDE_DIRS})
   target_link_libraries(tarmac-browser ${CURSES_LIBRARIES})

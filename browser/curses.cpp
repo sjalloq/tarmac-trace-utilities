@@ -17,6 +17,7 @@
  */
 
 #include "browse.hh"
+#include "disassembly.hh"
 #include "libtarmac/argparse.hh"
 #include "libtarmac/disktree.hh"
 #include "libtarmac/expr.hh"
@@ -34,6 +35,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -106,6 +108,13 @@ using std::vector;
     X(HELP_KEY, A_BOLD, A_BOLD, 2, 0, A_BOLD, 2, 0)                            \
     X(HELP_DESCRIPTION, A_NORMAL, A_NORMAL, 7, 0, A_NORMAL, 7, 0)              \
     X(HELP_SCROLL_INDICATOR, A_NORMAL, A_NORMAL, 6, 0, A_NORMAL, 6, 0)         \
+    X(DISASM_TEXT, A_NORMAL, A_NORMAL, 7, 0, A_NORMAL, 7, 0)                   \
+    X(DISASM_ADDRESS, A_BOLD, A_BOLD, 6, 0, A_BOLD, 6, 0)                      \
+    X(DISASM_MNEMONIC, A_BOLD, A_BOLD, 2, 0, A_BOLD, 2, 0)                     \
+    X(DISASM_SOURCE, A_NORMAL, A_NORMAL, 3, 0, A_NORMAL, 3, 0)                 \
+    X(DISASM_FUNCHEADER, A_BOLD, A_BOLD, 5, 0, A_BOLD, 5, 0)                   \
+    X(DISASM_CURRENT, A_REVERSE, A_REVERSE, 7, 0, A_REVERSE, 7, 0)             \
+    X(STATUSLINE_DIM, A_NORMAL, A_NORMAL, 6, 0, A_NORMAL, 6, 0)                \
     /* end of list */
 
 #define ATTR_COLOUR_PAIR_ENUM(name, base, base8, fg8, bg8, base256, fg256,     \
@@ -145,11 +154,13 @@ struct cursorpos {
 class Window {
   protected:
     Screen *screen;
+    bool focused;
 
   public:
-    Window() : screen(NULL) {}
+    Window() : screen(NULL), focused(false) {}
     virtual ~Window() = default;
     virtual void set_screen(Screen *screen_) { screen = screen_; }
+    virtual void set_focused(bool f) { focused = f; }
     virtual void set_size(int w, int h) = 0;
     virtual void draw(int x, int y, cursorpos *cp) = 0;
     virtual bool process_key(int c) { return false; }
@@ -294,6 +305,11 @@ class Screen : public Window {
     vector<Window *> win_subs;
     vector<int> sub_heights;
 
+    Window *win_side;
+    int side_width;
+    int side_pct; // user-controllable percentage of width for side panel
+    bool side_visible;
+
     Window *win_selected;
     Window *win_help;
 
@@ -305,9 +321,22 @@ class Screen : public Window {
 
     bool terminated;
 
+    int left_width() const
+    {
+        if (win_side && side_visible && w >= 100)
+            return w - side_width - 2; // 1 separator + 1 space
+        return w;
+    }
+
   public:
+    // True when the terminal is wide enough to actually render the
+    // side panel. Used by callers so they can report to the user why
+    // a toggle didn't take effect.
+    bool side_panel_displayable() const { return win_side && w >= 100; }
+
     Screen(Browser &br)
-        : Window(), w(0), h(0), win_main(NULL), win_selected(NULL),
+        : Window(), w(0), h(0), win_main(NULL), win_side(NULL),
+          side_width(0), side_pct(40), side_visible(false), win_selected(NULL),
           win_help(NULL), minibuf_active(false), terminated(false)
     {
     }
@@ -322,19 +351,37 @@ class Screen : public Window {
 
     void resize_wins()
     {
+        // Compute side panel width first, so left_width() is correct
+        // for the single sizing pass below.
+        if (win_side && side_visible && w >= 100) {
+            side_width = max(20, w * side_pct / 100);
+            int lw = w - side_width - 2; // 1 separator + 1 space
+            if (lw < 60) {
+                lw = 60;
+                side_width = w - lw - 2;
+            }
+            if (side_width < 20)
+                side_width = 0;
+        } else {
+            side_width = 0;
+        }
+
+        int lw = left_width();
         int total_height = h - 1;
         sub_heights.clear();
         for (auto win : win_subs) {
-            int swh = win->get_height_for_width(w);
+            int swh = win->get_height_for_width(lw);
             swh = min(swh, total_height);
-            win->set_size(w, swh);
+            win->set_size(lw, swh);
             sub_heights.push_back(swh);
             total_height -= swh;
         }
-        if (win_main) {
-            win_main->set_size(w, total_height);
-        }
+        if (win_main)
+            win_main->set_size(lw, total_height);
         main_height = total_height;
+
+        if (win_side && side_width > 0)
+            win_side->set_size(side_width, h - 1);
 
         if (win_help)
             win_help->set_size(w, h);
@@ -367,6 +414,40 @@ class Screen : public Window {
                 return;
             }
         }
+    }
+
+    void set_side_panel(Window *win)
+    {
+        win->set_screen(this);
+        win_side = win;
+        side_visible = true;
+        resize_wins();
+    }
+
+    void remove_side_panel()
+    {
+        if (win_selected == win_side)
+            win_selected = win_main;
+        side_visible = false;
+        resize_wins();
+    }
+
+    void toggle_side_panel()
+    {
+        if (side_visible)
+            remove_side_panel();
+        else if (win_side) {
+            side_visible = true;
+            resize_wins();
+        }
+    }
+
+    void adjust_side_panel(int delta_pct)
+    {
+        if (!win_side || !side_visible)
+            return;
+        side_pct = max(15, min(75, side_pct + delta_pct));
+        resize_wins();
     }
 
     void set_size(int w_, int h_)
@@ -411,16 +492,35 @@ class Screen : public Window {
             cursorpos cp2;
 
             if (win_main) {
+                win_main->set_focused(win_main == win_selected);
                 win_main->draw(x, y, &cp2);
                 if (!minibuf_active && win_main == win_selected)
                     *cp = cp2;
             }
             int yy = y + main_height;
             for (int i = 0; i < win_subs.size(); i++) {
+                win_subs[i]->set_focused(win_subs[i] == win_selected);
                 win_subs[i]->draw(x, yy, &cp2);
                 if (win_subs[i] == win_selected)
                     *cp = cp2;
                 yy += sub_heights[i];
+            }
+
+            // Draw side panel if active
+            if (win_side && side_visible && side_width > 0 && w >= 100) {
+                int side_x = left_width();
+                // Draw vertical separator and padding space
+                setattr(ATTR_DISASM_TEXT);
+                for (int i = 0; i < h - 1; i++) {
+                    move(y + i, x + side_x);
+                    addch('|');
+                    addch(' ');
+                }
+                // Draw side panel
+                win_side->set_focused(win_side == win_selected);
+                win_side->draw(x + side_x + 2, y, &cp2);
+                if (win_side == win_selected)
+                    *cp = cp2;
             }
         } else {
             string blank = rpad("", w);
@@ -506,11 +606,18 @@ class Screen : public Window {
             if (win_selected == win_main) {
                 if (win_subs.size() > 0)
                     win_selected = win_subs[0];
+                else if (win_side && side_visible)
+                    win_selected = win_side;
+            } else if (win_side && side_visible &&
+                       win_selected == win_side) {
+                win_selected = win_main;
             } else {
                 for (int i = 0; i < win_subs.size(); i++) {
                     if (win_selected == win_subs[i]) {
                         if (i + 1 < win_subs.size()) {
                             win_selected = win_subs[i + 1];
+                        } else if (win_side && side_visible) {
+                            win_selected = win_side;
                         } else {
                             win_selected = win_main;
                         }
@@ -632,6 +739,193 @@ void curses_hl_display(const HighlightedLine &line, bool highlight,
     }
 }
 
+class DisassemblyDisplay : public Window {
+    DisassemblyFile &disasm;
+    int w, h;
+    int topline;
+    size_t current_pc_line; // line index in disasm file for current PC
+    std::string current_func_name;
+    bool pc_found;
+
+    void clamp_topline()
+    {
+        int total = (int)disasm.total_lines();
+        topline = min(topline, total - (h - 1));
+        topline = max(topline, 0);
+    }
+
+  public:
+    DisassemblyDisplay(DisassemblyFile &disasm_)
+        : Window(), disasm(disasm_), w(0), h(0), topline(0),
+          current_pc_line(SIZE_MAX), pc_found(false)
+    {
+    }
+
+    int get_height_for_width(int /*w*/) { return 0; }
+
+    void set_size(int w_, int h_)
+    {
+        w = w_;
+        h = h_;
+        clamp_topline();
+    }
+
+    void sync_to_pc(uint64_t pc)
+    {
+        current_func_name.clear();
+        size_t line_idx = disasm.find_line_for_pc(pc);
+        if (line_idx == SIZE_MAX) {
+            pc_found = false;
+            current_pc_line = SIZE_MAX;
+            return;
+        }
+
+        pc_found = true;
+        current_pc_line = line_idx;
+
+        for (size_t i = line_idx + 1; i > 0; i--) {
+            const DisasmLine &dl = disasm.line_at(i - 1);
+            if (dl.type == DisasmLine::FunctionHeader) {
+                current_func_name = dl.func_name;
+                break;
+            }
+        }
+
+        // Check if current PC line is already visible
+        int visible_height = h - 1; // subtract status line
+        if (visible_height < 1)
+            visible_height = 1;
+        int pc_screen_pos = (int)current_pc_line - topline;
+        if (pc_screen_pos >= 0 && pc_screen_pos < visible_height)
+            return; // already visible, don't scroll
+
+        // Position PC at roughly 1/3 from top
+        topline = (int)current_pc_line - visible_height / 3;
+        clamp_topline();
+    }
+
+    // Expand tabs and truncate/pad to exactly 'width' visible characters.
+    static string expand_and_fit(const string &s, int width)
+    {
+        string out;
+        out.reserve(width);
+        for (char c : s) {
+            if (out.size() >= (size_t)width)
+                break;
+            if (c == '\t') {
+                int spaces = 8 - (out.size() % 8);
+                for (int j = 0; j < spaces && (int)out.size() < width; j++)
+                    out.push_back(' ');
+            } else {
+                out.push_back(c);
+            }
+        }
+        if ((int)out.size() < width)
+            out.append(width - out.size(), ' ');
+        return out;
+    }
+
+    void draw(int x, int y, cursorpos *cp)
+    {
+        cp->visible = false;
+        int visible_height = h - 1; // reserve bottom line for status
+
+        for (int i = 0; i < visible_height; i++) {
+            int line_idx = topline + i;
+            move(y + i, x);
+
+            if (line_idx < 0 || line_idx >= (int)disasm.total_lines()) {
+                setattr(ATTR_DISASM_TEXT);
+                string blank = rpad("", w);
+                addstr(blank.c_str());
+                continue;
+            }
+
+            const DisasmLine &dl = disasm.line_at(line_idx);
+            bool is_current = (pc_found &&
+                               (size_t)line_idx == current_pc_line);
+
+            string fitted = expand_and_fit(dl.text, w);
+
+            if (is_current) {
+                setattr(ATTR_DISASM_CURRENT);
+                addstr(fitted.c_str());
+            } else {
+                int attr;
+                switch (dl.type) {
+                case DisasmLine::FunctionHeader:
+                    attr = ATTR_DISASM_FUNCHEADER;
+                    break;
+                case DisasmLine::Source:
+                    attr = ATTR_DISASM_SOURCE;
+                    break;
+                case DisasmLine::Instruction:
+                    attr = ATTR_DISASM_TEXT;
+                    break;
+                default:
+                    attr = ATTR_DISASM_TEXT;
+                    break;
+                }
+                setattr(attr);
+                addstr(fitted.c_str());
+            }
+        }
+
+        // Draw status line
+        {
+            string status;
+            if (!pc_found) {
+                status = "Disassembly: PC not found";
+            } else if (!current_func_name.empty()) {
+                status = "Disassembly: " + current_func_name;
+            } else {
+                status = "Disassembly";
+            }
+            status = rpad(status, w);
+            move(y + visible_height, x);
+            setattr(focused ? ATTR_STATUSLINE : ATTR_STATUSLINE_DIM);
+            addstr(status.c_str());
+        }
+    }
+
+    bool process_key(int c);
+
+    vector<HelpItem> help_text()
+    {
+        return {
+            {"Up, Down", _("Scroll disassembly by one line")},
+            {"PgUp, PgDn", _("Scroll disassembly by a page")},
+            {"<, >", _("Shrink / grow the disassembly panel")},
+        };
+    }
+};
+
+bool DisassemblyDisplay::process_key(int c)
+{
+    if (c == '<') {
+        screen->adjust_side_panel(-5);
+        return true;
+    } else if (c == '>') {
+        screen->adjust_side_panel(+5);
+        return true;
+    }
+
+    int dy = 0;
+    if (c == KEY_DOWN)
+        dy = +1;
+    else if (c == KEY_UP)
+        dy = -1;
+    else if (c == KEY_NPAGE)
+        dy = h - 2;
+    else if (c == KEY_PPAGE)
+        dy = -(h - 2);
+    else
+        return false;
+    topline += dy;
+    clamp_topline();
+    return true;
+}
+
 class TraceBuffer : public Window {
     Browser &br;
     Browser::TraceView vu;
@@ -658,6 +952,7 @@ class TraceBuffer : public Window {
     NeonRegisterDisplay *neondisp;
     MVERegisterDisplay *mvedisp;
     vector<MemoryDisplay *> mdisps;
+    DisassemblyDisplay *disasm_disp;
     char minibuf_reqtype;
 
     int last_keystroke;
@@ -679,6 +974,7 @@ class TraceBuffer : public Window {
         srdisp = NULL;
         neondisp = NULL;
         mvedisp = NULL;
+        disasm_disp = NULL;
 
         goto_physline(1);
         set_crdisp(true);
@@ -742,6 +1038,7 @@ class TraceBuffer : public Window {
     void set_mvedisp(bool wanted);
     void add_mdisp(MemoryDisplayStartAddr address);
     void remove_mdisp(MemoryDisplay *mdisp);
+    void set_disasm_display(DisassemblyDisplay *disp) { disasm_disp = disp; }
     void update_other_windows();
     void update_other_windows_diff(unsigned prev_line);
 
@@ -818,7 +1115,7 @@ class TraceBuffer : public Window {
                 statusline << "   [HIDDEN]";
             string statusstr = rpad(statusline.str(), w);
             move(y + hm1, x);
-            setattr(ATTR_STATUSLINE);
+            setattr(focused ? ATTR_STATUSLINE : ATTR_STATUSLINE_DIM);
             addstr(statusstr.c_str());
         }
 
@@ -881,6 +1178,7 @@ class TraceBuffer : public Window {
             {"r", _("Toggle display of the core registers")},
             {"S, D", _("Toggle display of the single / double FP registers")},
             {"m", _("Open a memory view at a specified address")},
+            {"d", _("Toggle disassembly side panel")},
             {"", ""},
             {"a", _("Highlight a single event within the current time")},
             {"Return", _("Jump to the previous change to the memory accessed by "
@@ -1112,6 +1410,19 @@ class TraceBuffer : public Window {
         } else if (c == 'M') {
             // Toggle MVE vector register display window on/off
             set_mvedisp(mvedisp == NULL);
+            return true;
+        } else if (c == 'd') {
+            // Toggle disassembly side panel
+            if (!disasm_disp) {
+                screen->minibuf_error(
+                    _("No disassembly file loaded (use --disassembly)"));
+            } else if (!screen->side_panel_displayable()) {
+                screen->minibuf_error(
+                    _("Terminal too narrow for disassembly panel "
+                      "(need >=100 columns)"));
+            } else {
+                screen->toggle_side_panel();
+            }
             return true;
         } else if (c == '\x0C') { // Ctrl-L
             // Emacs-like ^L handling: on the first press, centre the
@@ -1419,7 +1730,7 @@ class RegisterDisplay : public Window {
             }
             string statusstr = rpad(statusline.str(), w);
             move(y + h - 1, x);
-            setattr(ATTR_STATUSLINE);
+            setattr(focused ? ATTR_STATUSLINE : ATTR_STATUSLINE_DIM);
             addstr(statusstr.c_str());
         }
     }
@@ -1869,7 +2180,7 @@ class MemoryDisplay : public Window {
                 statusline << "   following: " << cursor_addr_exprstr;
             string statusstr = rpad(statusline.str(), w);
             move(y + h - 1, x);
-            setattr(ATTR_STATUSLINE);
+            setattr(focused ? ATTR_STATUSLINE : ATTR_STATUSLINE_DIM);
             addstr(statusstr.c_str());
         }
     }
@@ -2194,6 +2505,8 @@ void TraceBuffer::update_other_windows()
     for (auto mdisp : mdisps)
         mdisp->set_memroot(vu.curr_logical_node.memory_root,
                            vu.curr_logical_node.trace_file_firstline);
+    if (disasm_disp)
+        disasm_disp->sync_to_pc(vu.curr_visible_node.pc);
 }
 
 void TraceBuffer::update_other_windows_diff(unsigned line)
@@ -2212,11 +2525,19 @@ void TraceBuffer::update_other_windows_diff(unsigned line)
         mdisp->diff_against_if_not_locked(line);
 }
 
-void run_browser(Browser &br, bool use_terminal_colours)
+void run_browser(Browser &br, bool use_terminal_colours,
+                 DisassemblyFile *disasm)
 {
     Screen scr(br);
     TraceBuffer tbuf(br);
     scr.set_main_window(&tbuf);
+
+    std::unique_ptr<DisassemblyDisplay> disasm_disp;
+    if (disasm) {
+        disasm_disp = std::make_unique<DisassemblyDisplay>(*disasm);
+        tbuf.set_disasm_display(disasm_disp.get());
+        scr.set_side_panel(disasm_disp.get());
+    }
 
     initscr();
     if (!has_colors()) // override if colour isn't even available
@@ -2281,6 +2602,8 @@ int main(int argc, char **argv)
             use_terminal_colours = false;
     }
 
+    string disassembly_filename;
+
     Argparse ap("tarmac-browser", argc, argv);
     TarmacUtility tu;
     tu.add_options(ap);
@@ -2289,11 +2612,19 @@ int main(int argc, char **argv)
     ap.optnoval({"--no-colour", "--no-color"},
                 _("don't use colour in the terminal"),
                 [&]() { use_terminal_colours = false; });
+    ap.optval({"--disassembly", "--dis"}, _("DISFILE"),
+              _("objdump disassembly file to display in a side panel"),
+              [&](const string &s) { disassembly_filename = s; });
     ap.parse();
     tu.setup();
 
+    std::unique_ptr<DisassemblyFile> disasm;
+    if (!disassembly_filename.empty())
+        disasm = std::make_unique<DisassemblyFile>(disassembly_filename,
+                                                   tu.load_offset);
+
     Browser br(tu.trace, tu.image_filename, tu.load_offset);
-    run_browser(br, use_terminal_colours);
+    run_browser(br, use_terminal_colours, disasm.get());
 
     return 0;
 }
